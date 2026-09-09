@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""
+Camera Troubleshooting Checklist - GUI Edition
+================================================
+
+A Tkinter desktop app for troubleshooting IP/PoE cameras on an
+NVR-based system, one camera at a time:
+
+  1. Enter site + technician info.
+  2. Add a camera (name/location + IP) and run automated network
+     diagnostics (ping, common port checks, HTTP reachability).
+  3. Optionally walk through a guided manual checklist, one question
+     at a time (Pass / Fail / Skip + optional note).
+  4. Record a resolution note, then move to the next camera.
+  5. When finished, view a summary and export the full report as a
+     plain-text file and/or a Word (.docx) document.
+
+Requires:
+  - Python 3 with Tkinter (bundled with the standard python.org
+    Windows/Mac installers; on Linux install the OS's python3-tk
+    package if it's missing).
+  - python-docx  ->  pip install python-docx
+"""
+
+import os
+import sys
+import socket
+import subprocess
+import platform
+import threading
+import queue
+import urllib.request
+import urllib.error
+import ssl
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+from datetime import datetime
+
+try:
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+
+# ==========================================================================
+# Configuration / static data
+# ==========================================================================
+
+DEFAULT_PORTS = [
+    (80, "HTTP / Web UI"),
+    (443, "HTTPS / Web UI"),
+    (554, "RTSP (video stream)"),
+    (8000, "NVR / camera admin (common)"),
+    (37777, "Dahua proprietary port"),
+]
+
+PING_TIMEOUT_SEC = 2
+PORT_TIMEOUT_SEC = 2
+HTTP_TIMEOUT_SEC = 3
+
+REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+
+# (category, question)
+MANUAL_CHECKLIST = [
+    ("Power", "Does the camera have a solid power/status LED (not off or blinking red)?"),
+    ("Power", "If using a PoE injector/switch, is the port's PoE/link light on?"),
+    ("Cabling", "Is the Ethernet cable fully seated at both the camera and switch/patch panel?"),
+    ("Cabling", "Is the cable run free of visible damage, kinks, or exposed wire?"),
+    ("Cabling", "Have you tried swapping in a known-good patch cable at the camera end?"),
+    ("Switch/Network", "Is the switch port's link light active (not dark)?"),
+    ("Switch/Network", "Have you tried moving the camera to a different, known-good switch port?"),
+    ("Switch/Network", "Is the camera on the correct VLAN/subnet for the NVR to see it?"),
+    ("Switch/Network", "Is there an IP conflict (another device using the same IP)?"),
+    ("NVR", "Does the NVR show this channel as connected/recording?"),
+    ("NVR", "Have you tried rebooting the NVR channel or re-adding the camera?"),
+    ("Camera", "Have you power-cycled the camera itself (unplug/replug or PoE reboot)?"),
+    ("Camera", "Is the lens free of obstruction, dirt, cobwebs, or condensation?"),
+    ("Camera", "At night, are the IR illuminators turning on (check for IR glow)?"),
+    ("Camera", "Is the image in focus and properly aimed at the intended area?"),
+    ("Firmware/Config", "Is the camera running current firmware (per site standard)?"),
+    ("Firmware/Config", "Have you verified the camera's IP/credentials match site documentation?"),
+]
+
+
+# ==========================================================================
+# Automated network diagnostics (unchanged logic from the CLI version)
+# ==========================================================================
+
+def ping_host(ip, timeout=PING_TIMEOUT_SEC):
+    is_windows = platform.system().lower() == "windows"
+    if is_windows:
+        cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), ip]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(timeout), ip]
+    try:
+        creationflags = 0x08000000 if is_windows else 0  # CREATE_NO_WINDOW on Windows
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 2,
+            creationflags=creationflags,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def check_port(ip, port, timeout=PORT_TIMEOUT_SEC):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def check_http(ip, timeout=HTTP_TIMEOUT_SEC):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for scheme in ("http", "https"):
+        url = f"{scheme}://{ip}/"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            kwargs = {"timeout": timeout}
+            if scheme == "https":
+                kwargs["context"] = ctx
+            with urllib.request.urlopen(req, **kwargs) as resp:
+                return True, f"{scheme.upper()} responded, status {resp.status}"
+        except urllib.error.HTTPError as e:
+            return True, f"{scheme.upper()} responded, status {e.code}"
+        except Exception:
+            continue
+    return False, "No HTTP/HTTPS response"
+
+
+def run_automated_checks(ip, progress_cb, ports=DEFAULT_PORTS):
+    """
+    Run ping + port checks + HTTP check.
+    progress_cb(message) is called after each individual check completes,
+    so the caller can stream live status to a UI.
+    Returns a results dict.
+    """
+    results = {}
+
+    progress_cb(f"Pinging {ip} ...")
+    ping_ok = ping_host(ip)
+    progress_cb(f"  -> {'reachable' if ping_ok else 'NO RESPONSE'}")
+    results["ping"] = ping_ok
+
+    results["ports"] = {}
+    for port, label in ports:
+        progress_cb(f"Checking port {port} ({label}) ...")
+        ok = check_port(ip, port)
+        progress_cb(f"  -> {'OPEN' if ok else 'closed/unreachable'}")
+        results["ports"][port] = {"label": label, "ok": ok}
+
+    progress_cb("Checking web UI (HTTP/HTTPS) ...")
+    http_ok, http_detail = check_http(ip)
+    progress_cb(f"  -> {http_detail}")
+    results["http"] = {"ok": http_ok, "detail": http_detail}
+
+    return results
+
+
+def automated_checks_all_passed(results):
+    if not results["ping"]:
+        return False
+    if not any(p["ok"] for p in results["ports"].values()):
+        return False
+    if not results["http"]["ok"]:
+        return False
+    return True
+
+
+# ==========================================================================
+# Report building (plain text + docx)
+# ==========================================================================
+
+def format_text_report(site_name, tech_name, timestamp_str, camera_reports):
+    lines = []
+    lines.append("=" * 70)
+    lines.append("CAMERA TROUBLESHOOTING REPORT")
+    lines.append("=" * 70)
+    lines.append(f"Site:        {site_name}")
+    lines.append(f"Technician:  {tech_name}")
+    lines.append(f"Date/Time:   {timestamp_str}")
+    lines.append(f"Cameras checked: {len(camera_reports)}")
+    lines.append("")
+
+    lines.append("-" * 70)
+    lines.append("SUMMARY")
+    lines.append("-" * 70)
+    for cr in camera_reports:
+        cam = cr["camera"]
+        status = "PASS" if cr["auto_passed"] else "ISSUES FOUND"
+        fails = [r for r in cr["manual_results"] if r["answer"] == "FAIL"]
+        extra = f", {len(fails)} manual item(s) failed" if fails else ""
+        lines.append(f"  {cam['label']:<25} {cam['ip']:<16} {status}{extra}")
+    lines.append("")
+
+    for cr in camera_reports:
+        cam = cr["camera"]
+        auto = cr["auto_results"]
+        lines.append("-" * 70)
+        lines.append(f"CAMERA: {cam['label']}  ({cam['ip']})")
+        lines.append("-" * 70)
+        lines.append(f"  Ping: {'OK' if auto['ping'] else 'NO RESPONSE'}")
+        for port, info in auto["ports"].items():
+            lines.append(f"  Port {port} ({info['label']}): {'OPEN' if info['ok'] else 'closed/unreachable'}")
+        lines.append(f"  Web UI: {auto['http']['detail']}")
+        lines.append("")
+
+        if cr["manual_results"]:
+            lines.append("  Manual checklist:")
+            last_cat = None
+            for r in cr["manual_results"]:
+                if r["category"] != last_cat:
+                    lines.append(f"    [{r['category']}]")
+                    last_cat = r["category"]
+                note = f"  -- {r['note']}" if r["note"] else ""
+                lines.append(f"      [{r['answer']:<7}] {r['question']}{note}")
+            lines.append("")
+
+        if cr["resolution"]:
+            lines.append(f"  Resolution/Notes: {cr['resolution']}")
+        lines.append("")
+
+    lines.append("=" * 70)
+    lines.append("END OF REPORT")
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
+def build_docx_report(site_name, tech_name, timestamp_str, camera_reports, path):
+    """Build and save a Word (.docx) version of the report."""
+    if not DOCX_AVAILABLE:
+        raise RuntimeError("python-docx is not installed. Run: pip install python-docx")
+
+    doc = Document()
+
+    title = doc.add_heading("Camera Troubleshooting Report", level=0)
+
+    meta = doc.add_paragraph()
+    meta.add_run(f"Site: ").bold = True
+    meta.add_run(f"{site_name}\n")
+    meta.add_run(f"Technician: ").bold = True
+    meta.add_run(f"{tech_name}\n")
+    meta.add_run(f"Date/Time: ").bold = True
+    meta.add_run(f"{timestamp_str}\n")
+    meta.add_run(f"Cameras checked: ").bold = True
+    meta.add_run(f"{len(camera_reports)}")
+
+    doc.add_heading("Summary", level=1)
+    table_style = "Light Grid Accent 1"
+    try:
+        summary_table = doc.add_table(rows=1, cols=4, style=table_style)
+    except KeyError:
+        summary_table = doc.add_table(rows=1, cols=4, style="Table Grid")
+    hdr = summary_table.rows[0].cells
+    hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = "Camera", "IP Address", "Status", "Manual Issues"
+    for cr in camera_reports:
+        cam = cr["camera"]
+        status = "PASS" if cr["auto_passed"] else "ISSUES FOUND"
+        fails = [r for r in cr["manual_results"] if r["answer"] == "FAIL"]
+        row = summary_table.add_row().cells
+        row[0].text = cam["label"]
+        row[1].text = cam["ip"]
+        row[2].text = status
+        row[3].text = str(len(fails)) if fails else "-"
+
+    for cr in camera_reports:
+        cam = cr["camera"]
+        auto = cr["auto_results"]
+
+        doc.add_heading(f"{cam['label']}  ({cam['ip']})", level=1)
+
+        doc.add_heading("Automated Checks", level=2)
+        try:
+            auto_table = doc.add_table(rows=1, cols=2, style=table_style)
+        except KeyError:
+            auto_table = doc.add_table(rows=1, cols=2, style="Table Grid")
+        hdr = auto_table.rows[0].cells
+        hdr[0].text, hdr[1].text = "Check", "Result"
+
+        row = auto_table.add_row().cells
+        row[0].text = "Ping"
+        row[1].text = "OK" if auto["ping"] else "NO RESPONSE"
+        for port, info in auto["ports"].items():
+            row = auto_table.add_row().cells
+            row[0].text = f"Port {port} ({info['label']})"
+            row[1].text = "OPEN" if info["ok"] else "closed/unreachable"
+        row = auto_table.add_row().cells
+        row[0].text = "Web UI"
+        row[1].text = auto["http"]["detail"]
+
+        if cr["manual_results"]:
+            doc.add_heading("Manual Checklist", level=2)
+            try:
+                man_table = doc.add_table(rows=1, cols=4, style=table_style)
+            except KeyError:
+                man_table = doc.add_table(rows=1, cols=4, style="Table Grid")
+            hdr = man_table.rows[0].cells
+            hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = "Category", "Question", "Answer", "Note"
+            for r in cr["manual_results"]:
+                row = man_table.add_row().cells
+                row[0].text = r["category"]
+                row[1].text = r["question"]
+                row[2].text = r["answer"]
+                row[3].text = r["note"] or "-"
+
+        res_para = doc.add_paragraph()
+        res_para.add_run("Resolution/Notes: ").bold = True
+        res_para.add_run(cr["resolution"] or "-")
+
+        doc.add_paragraph("")  # spacing
+
+    doc.save(path)
+
+
+def save_text_report(report_text, site_name, timestamp):
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    safe_site = safe_filename(site_name)
+    fname = f"report_{safe_site}_{timestamp.strftime('%Y%m%d_%H%M%S')}.txt"
+    path = os.path.join(REPORTS_DIR, fname)
+    with open(path, "w") as f:
+        f.write(report_text)
+    return path
+
+
+def safe_filename(name):
+    safe = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name).strip()
+    return safe.replace(" ", "_") or "site"
+
+
+# ==========================================================================
+# GUI application
+# ==========================================================================
+
+class CameraChecklistApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Camera Troubleshooting Checklist")
+        self.geometry("820x640")
+        self.minsize(700, 560)
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"))
+        style.configure("SubHeader.TLabel", font=("Segoe UI", 11, "bold"))
+        style.configure("Category.TLabel", font=("Segoe UI", 10, "bold"), foreground="#2c5f8a")
+        style.configure("Pass.TButton", foreground="#1a7a2e")
+        style.configure("Fail.TButton", foreground="#b02a2a")
+
+        # session state
+        self.site_name = ""
+        self.tech_name = ""
+        self.camera_reports = []          # finished camera reports
+        self.current_camera = None        # dict {label, ip}
+        self.current_auto_results = None
+        self.current_manual_answers = {}  # index -> {answer, note}
+        self.manual_index = 0
+
+        # persistent header bar
+        self.info_bar = ttk.Label(self, text="", anchor="w", padding=(10, 4))
+        self.info_bar.pack(side="top", fill="x")
+        ttk.Separator(self).pack(side="top", fill="x")
+
+        # main content area, rebuilt per screen
+        self.content = ttk.Frame(self, padding=20)
+        self.content.pack(side="top", fill="both", expand=True)
+
+        self.check_queue = queue.Queue()
+
+        self.show_site_screen()
+
+    # ---------------------------------------------------------- helpers --
+
+    def clear_content(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+    def update_info_bar(self):
+        if self.site_name:
+            done = len(self.camera_reports)
+            self.info_bar.config(
+                text=f"Site: {self.site_name}    |    Technician: {self.tech_name}    |    Cameras completed: {done}"
+            )
+        else:
+            self.info_bar.config(text="")
+
+    # ---------------------------------------------------- screen: site --
+
+    def show_site_screen(self):
+        self.clear_content()
+        ttk.Label(self.content, text="Camera Troubleshooting Checklist", style="Header.TLabel").pack(pady=(0, 20))
+
+        form = ttk.Frame(self.content)
+        form.pack(pady=10)
+
+        ttk.Label(form, text="Site name:").grid(row=0, column=0, sticky="e", padx=6, pady=8)
+        site_entry = ttk.Entry(form, width=35)
+        site_entry.grid(row=0, column=1, padx=6, pady=8)
+        site_entry.insert(0, self.site_name)
+
+        ttk.Label(form, text="Technician name:").grid(row=1, column=0, sticky="e", padx=6, pady=8)
+        tech_entry = ttk.Entry(form, width=35)
+        tech_entry.grid(row=1, column=1, padx=6, pady=8)
+        tech_entry.insert(0, self.tech_name)
+
+        def start():
+            self.site_name = site_entry.get().strip() or "Unnamed Site"
+            self.tech_name = tech_entry.get().strip() or "Unknown"
+            self.update_info_bar()
+            self.show_camera_entry_screen()
+
+        site_entry.focus_set()
+        self.bind_enter(form, start)
+        ttk.Button(self.content, text="Start  →", command=start).pack(pady=20)
+
+    def bind_enter(self, widget, callback):
+        for child in widget.winfo_children():
+            child.bind("<Return>", lambda e: callback())
+
+    # ------------------------------------------------- screen: add cam --
+
+    def show_camera_entry_screen(self):
+        self.clear_content()
+        self.update_info_bar()
+
+        ttk.Label(self.content, text="Add a Camera", style="Header.TLabel").pack(pady=(0, 20))
+
+        form = ttk.Frame(self.content)
+        form.pack(pady=10)
+
+        ttk.Label(form, text="Camera name / location:").grid(row=0, column=0, sticky="e", padx=6, pady=8)
+        label_entry = ttk.Entry(form, width=35)
+        label_entry.grid(row=0, column=1, padx=6, pady=8)
+
+        ttk.Label(form, text="IP address:").grid(row=1, column=0, sticky="e", padx=6, pady=8)
+        ip_entry = ttk.Entry(form, width=35)
+        ip_entry.grid(row=1, column=1, padx=6, pady=8)
+
+        def run_checks():
+            label = label_entry.get().strip()
+            ip = ip_entry.get().strip()
+            if not label or not ip:
+                messagebox.showwarning("Missing info", "Please enter both a camera name/location and an IP address.")
+                return
+            self.current_camera = {"label": label, "ip": ip}
+            self.show_running_checks_screen()
+
+        label_entry.focus_set()
+        self.bind_enter(form, run_checks)
+        ttk.Button(self.content, text="Run Automated Checks  →", command=run_checks).pack(pady=15)
+
+        if self.camera_reports:
+            ttk.Separator(self.content).pack(fill="x", pady=15)
+            ttk.Label(self.content, text="Completed this session:", style="SubHeader.TLabel").pack(anchor="w")
+            listframe = ttk.Frame(self.content)
+            listframe.pack(fill="both", expand=True, pady=5)
+            for cr in self.camera_reports:
+                cam = cr["camera"]
+                status = "PASS" if cr["auto_passed"] else "ISSUES FOUND"
+                color = "#1a7a2e" if cr["auto_passed"] else "#b02a2a"
+                row = ttk.Frame(listframe)
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=f"  {cam['label']} ({cam['ip']})", anchor="w").pack(side="left")
+                tk.Label(row, text=status, fg=color, anchor="e").pack(side="right", padx=10)
+
+            ttk.Button(self.content, text="Finish & View Summary", command=self.show_summary_screen).pack(pady=10)
+
+    # -------------------------------------------- screen: running checks --
+
+    def show_running_checks_screen(self):
+        self.clear_content()
+        self.update_info_bar()
+
+        cam = self.current_camera
+        ttk.Label(self.content, text=f"Checking: {cam['label']} ({cam['ip']})", style="Header.TLabel").pack(pady=(0, 15))
+
+        self.log_box = scrolledtext.ScrolledText(self.content, height=18, state="disabled", font=("Consolas", 10))
+        self.log_box.pack(fill="both", expand=True, pady=10)
+
+        self.checks_result_frame = ttk.Frame(self.content)
+        self.checks_result_frame.pack(fill="x", pady=10)
+
+        # kick off background thread
+        thread = threading.Thread(target=self._checks_worker, args=(cam["ip"],), daemon=True)
+        thread.start()
+        self.after(100, self._poll_check_queue)
+
+    def _checks_worker(self, ip):
+        def progress_cb(msg):
+            self.check_queue.put(("log", msg))
+        try:
+            results = run_automated_checks(ip, progress_cb)
+            self.check_queue.put(("done", results))
+        except Exception as e:
+            self.check_queue.put(("error", str(e)))
+
+    def _poll_check_queue(self):
+        try:
+            while True:
+                kind, payload = self.check_queue.get_nowait()
+                if kind == "log":
+                    self._append_log(payload)
+                elif kind == "done":
+                    self.current_auto_results = payload
+                    self._show_checks_complete()
+                    return
+                elif kind == "error":
+                    self._append_log(f"ERROR: {payload}")
+                    self._show_checks_complete(error=True)
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_check_queue)
+
+    def _append_log(self, text):
+        self.log_box.config(state="normal")
+        self.log_box.insert("end", text + "\n")
+        self.log_box.see("end")
+        self.log_box.config(state="disabled")
+
+    def _show_checks_complete(self, error=False):
+        for w in self.checks_result_frame.winfo_children():
+            w.destroy()
+
+        if error:
+            ttk.Label(self.checks_result_frame, text="Automated checks failed to run.", foreground="#b02a2a").pack()
+            ttk.Button(self.checks_result_frame, text="Continue to Manual Checklist  →",
+                       command=self.start_manual_checklist).pack(pady=8)
+            return
+
+        all_passed = automated_checks_all_passed(self.current_auto_results)
+        if all_passed:
+            ttk.Label(self.checks_result_frame, text="All automated checks passed.", foreground="#1a7a2e",
+                      font=("Segoe UI", 10, "bold")).pack(pady=(0, 8))
+        else:
+            ttk.Label(self.checks_result_frame, text="One or more automated checks failed.", foreground="#b02a2a",
+                      font=("Segoe UI", 10, "bold")).pack(pady=(0, 8))
+
+        btns = ttk.Frame(self.checks_result_frame)
+        btns.pack()
+        ttk.Button(btns, text="Run Guided Manual Checklist  →", command=self.start_manual_checklist).pack(side="left", padx=6)
+        ttk.Button(btns, text="Skip Checklist → Add Notes", command=self.skip_manual_checklist).pack(side="left", padx=6)
+
+    # ------------------------------------------ screen: manual checklist --
+
+    def start_manual_checklist(self):
+        self.manual_index = 0
+        self.current_manual_answers = {}
+        self.show_manual_question_screen()
+
+    def skip_manual_checklist(self):
+        self.current_manual_answers = {}
+        self.show_resolution_screen()
+
+    def show_manual_question_screen(self):
+        self.clear_content()
+        self.update_info_bar()
+
+        total = len(MANUAL_CHECKLIST)
+        idx = self.manual_index
+        category, question = MANUAL_CHECKLIST[idx]
+
+        ttk.Label(self.content, text=f"Guided Manual Checklist  ({idx + 1} of {total})", style="Header.TLabel").pack(pady=(0, 5))
+        ttk.Label(self.content, text=category, style="Category.TLabel").pack(pady=(10, 5))
+        ttk.Label(self.content, text=question, font=("Segoe UI", 12), wraplength=700, justify="center").pack(pady=(0, 20))
+
+        prior = self.current_manual_answers.get(idx)
+
+        note_frame = ttk.Frame(self.content)
+        note_frame.pack(pady=5)
+        ttk.Label(note_frame, text="Note (optional, e.g. what you observed or tried):").pack(anchor="w")
+        note_text = tk.Text(note_frame, width=70, height=3)
+        note_text.pack()
+        if prior and prior.get("note"):
+            note_text.insert("1.0", prior["note"])
+
+        def record(answer_key):
+            note = note_text.get("1.0", "end").strip()
+            self.current_manual_answers[idx] = {
+                "category": category,
+                "question": question,
+                "answer": answer_key,
+                "note": note,
+            }
+            if self.manual_index + 1 < total:
+                self.manual_index += 1
+                self.show_manual_question_screen()
+            else:
+                self.finish_manual_checklist()
+
+        btn_frame = ttk.Frame(self.content)
+        btn_frame.pack(pady=15)
+        ttk.Button(btn_frame, text="✓ Pass", style="Pass.TButton", command=lambda: record("PASS")).pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="✗ Fail", style="Fail.TButton", command=lambda: record("FAIL")).pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="Skip", command=lambda: record("SKIPPED")).pack(side="left", padx=8)
+
+        nav_frame = ttk.Frame(self.content)
+        nav_frame.pack(pady=10)
+        back_btn = ttk.Button(nav_frame, text="← Back", command=self.manual_back)
+        back_btn.pack(side="left", padx=8)
+        if idx == 0:
+            back_btn.state(["disabled"])
+        ttk.Button(nav_frame, text="End Checklist Here → Add Notes", command=self.finish_manual_checklist).pack(side="left", padx=8)
+
+    def manual_back(self):
+        if self.manual_index > 0:
+            self.manual_index -= 1
+            self.show_manual_question_screen()
+
+    def finish_manual_checklist(self):
+        # convert dict (index -> answer) to an ordered list, only answered items
+        ordered = [self.current_manual_answers[i] for i in sorted(self.current_manual_answers.keys())]
+        self.current_manual_answers = ordered
+        self.show_resolution_screen()
+
+    # ------------------------------------------------ screen: resolution --
+
+    def show_resolution_screen(self):
+        self.clear_content()
+        self.update_info_bar()
+
+        cam = self.current_camera
+        ttk.Label(self.content, text=f"Resolution / Final Notes: {cam['label']}", style="Header.TLabel").pack(pady=(0, 15))
+
+        ttk.Label(self.content, text="What fixed it, or what still needs follow-up? (optional)").pack(anchor="w")
+        res_text = tk.Text(self.content, width=80, height=8)
+        res_text.pack(pady=10, fill="x")
+        res_text.focus_set()
+
+        def save_and(next_action):
+            manual_results = self.current_manual_answers if isinstance(self.current_manual_answers, list) else []
+            all_passed = automated_checks_all_passed(self.current_auto_results)
+            self.camera_reports.append({
+                "camera": self.current_camera,
+                "auto_results": self.current_auto_results,
+                "auto_passed": all_passed,
+                "manual_results": manual_results,
+                "resolution": res_text.get("1.0", "end").strip(),
+            })
+            self.current_camera = None
+            self.current_auto_results = None
+            self.current_manual_answers = {}
+            self.update_info_bar()
+            next_action()
+
+        btns = ttk.Frame(self.content)
+        btns.pack(pady=15)
+        ttk.Button(btns, text="Save & Add Another Camera", command=lambda: save_and(self.show_camera_entry_screen)).pack(side="left", padx=8)
+        ttk.Button(btns, text="Save & Finish Session → Summary", command=lambda: save_and(self.show_summary_screen)).pack(side="left", padx=8)
+
+    # ---------------------------------------------------- screen: summary --
+
+    def show_summary_screen(self):
+        self.clear_content()
+        self.update_info_bar()
+
+        ttk.Label(self.content, text="Session Summary", style="Header.TLabel").pack(pady=(0, 15))
+
+        if not self.camera_reports:
+            ttk.Label(self.content, text="No cameras were checked this session.").pack(pady=20)
+            ttk.Button(self.content, text="← Add a Camera", command=self.show_camera_entry_screen).pack()
+            return
+
+        columns = ("name", "ip", "status", "manual")
+        tree = ttk.Treeview(self.content, columns=columns, show="headings", height=8)
+        tree.heading("name", text="Camera")
+        tree.heading("ip", text="IP Address")
+        tree.heading("status", text="Status")
+        tree.heading("manual", text="Manual Fails")
+        tree.column("name", width=220)
+        tree.column("ip", width=140)
+        tree.column("status", width=140)
+        tree.column("manual", width=100, anchor="center")
+        tree.pack(fill="both", expand=True, pady=10)
+
+        for cr in self.camera_reports:
+            cam = cr["camera"]
+            status = "PASS" if cr["auto_passed"] else "ISSUES FOUND"
+            fails = len([r for r in cr["manual_results"] if r["answer"] == "FAIL"])
+            tree.insert("", "end", values=(cam["label"], cam["ip"], status, fails if fails else "-"))
+
+        self.summary_status_label = ttk.Label(self.content, text="", foreground="#1a7a2e")
+        self.summary_status_label.pack(pady=(5, 0))
+
+        btns = ttk.Frame(self.content)
+        btns.pack(pady=15)
+        ttk.Button(btns, text="Save Text Report (.txt)", command=self.export_text_report).pack(side="left", padx=6)
+        docx_btn = ttk.Button(btns, text="Export Word Report (.docx)", command=self.export_docx_report)
+        docx_btn.pack(side="left", padx=6)
+        if not DOCX_AVAILABLE:
+            docx_btn.state(["disabled"])
+            ttk.Label(self.content, text="python-docx is not installed — run: pip install python-docx",
+                      foreground="#b02a2a").pack(pady=(0, 5))
+        ttk.Button(btns, text="+ Add Another Camera", command=self.show_camera_entry_screen).pack(side="left", padx=6)
+
+        bottom = ttk.Frame(self.content)
+        bottom.pack(pady=5)
+        ttk.Button(bottom, text="Start New Session", command=self.new_session).pack(side="left", padx=6)
+        ttk.Button(bottom, text="Exit", command=self.destroy).pack(side="left", padx=6)
+
+    def _report_timestamp_and_text(self):
+        timestamp = datetime.now()
+        text = format_text_report(self.site_name, self.tech_name, timestamp.strftime("%Y-%m-%d %H:%M:%S"), self.camera_reports)
+        return timestamp, text
+
+    def export_text_report(self):
+        timestamp, text = self._report_timestamp_and_text()
+        try:
+            path = save_text_report(text, self.site_name, timestamp)
+        except Exception as e:
+            messagebox.showerror("Save failed", f"Could not save the text report:\n{e}")
+            return
+        self.summary_status_label.config(text=f"Text report saved: {path}")
+        messagebox.showinfo("Saved", f"Text report saved to:\n{path}")
+
+    def export_docx_report(self):
+        if not DOCX_AVAILABLE:
+            messagebox.showerror("Missing dependency", "python-docx is not installed.\n\nRun: pip install python-docx")
+            return
+        timestamp = datetime.now()
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        default_name = f"report_{safe_filename(self.site_name)}_{timestamp.strftime('%Y%m%d_%H%M%S')}.docx"
+        path = filedialog.asksaveasfilename(
+            title="Save Word Report",
+            initialdir=REPORTS_DIR,
+            initialfile=default_name,
+            defaultextension=".docx",
+            filetypes=[("Word Document", "*.docx")],
+        )
+        if not path:
+            return
+        try:
+            build_docx_report(self.site_name, self.tech_name, timestamp.strftime("%Y-%m-%d %H:%M:%S"), self.camera_reports, path)
+        except Exception as e:
+            messagebox.showerror("Export failed", f"Could not save the Word report:\n{e}")
+            return
+        self.summary_status_label.config(text=f"Word report saved: {path}")
+        messagebox.showinfo("Saved", f"Word report saved to:\n{path}")
+
+    def new_session(self):
+        if self.camera_reports:
+            if not messagebox.askyesno("Start new session", "This will clear the current session. Continue?"):
+                return
+        self.site_name = ""
+        self.tech_name = ""
+        self.camera_reports = []
+        self.current_camera = None
+        self.current_auto_results = None
+        self.current_manual_answers = {}
+        self.manual_index = 0
+        self.update_info_bar()
+        self.show_site_screen()
+
+
+# ==========================================================================
+# Entry point
+# ==========================================================================
+
+def main():
+    if not DOCX_AVAILABLE:
+        # Don't block the app from running -- just warn once at launch.
+        # The Export .docx button will be disabled until this is resolved.
+        print("NOTE: python-docx is not installed. Run 'pip install python-docx' "
+              "to enable Word (.docx) report export.")
+    app = CameraChecklistApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
