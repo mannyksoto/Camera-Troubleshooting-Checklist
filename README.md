@@ -1,5 +1,3 @@
-# Camera-Troubleshooting-Checklist
-
 CAMERA TROUBLESHOOTING CHECKLIST (GUI) - SETUP & USE
 ======================================================
 
